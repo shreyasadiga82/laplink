@@ -5,25 +5,42 @@ function App() {
   const [status, setStatus] = useState<string>('Disconnected');
   const [decodeStatus, setDecodeStatus] = useState<string>('Waiting for stream...');
   const [frames, setFrames] = useState<number>(0);
+  const [bytesReceived, setBytesReceived] = useState<number>(0);
   const videoRef = useRef<HTMLCanvasElement>(null);
   
   useEffect(() => {
     let ws: WebSocket;
     let pc: RTCPeerConnection;
     let videoDecoder: VideoDecoder | null = null;
+    let isDecoderConfigured = false;
+    let seenKeyFrame = false;
+    let spsNalu: Uint8Array | null = null;
+    let ppsNalu: Uint8Array | null = null;
+    let decodedFrames = 0;
+    let totalBytes = 0;
     
-    const initDecoder = async () => {
+    // Update UI every 500ms to prevent React re-render thrashing
+    const statsInterval = setInterval(() => {
+       setFrames(decodedFrames);
+       setBytesReceived(totalBytes);
+    }, 500);
+    
+    const initDecoder = () => {
        if (!videoRef.current) return;
-       const ctx = videoRef.current.getContext('2d');
+       const ctx = videoRef.current.getContext('2d', { alpha: false }); // alpha: false for better perf
        
        videoDecoder = new VideoDecoder({
          output: (frame) => {
-           setFrames(f => f + 1);
+           decodedFrames++;
            setDecodeStatus('Decoding OK');
            if (ctx && videoRef.current) {
-               videoRef.current.width = frame.displayWidth;
-               videoRef.current.height = frame.displayHeight;
-               ctx.drawImage(frame, 0, 0, videoRef.current.width, videoRef.current.height);
+               if (videoRef.current.width !== frame.displayWidth) {
+                   videoRef.current.width = frame.displayWidth;
+               }
+               if (videoRef.current.height !== frame.displayHeight) {
+                   videoRef.current.height = frame.displayHeight;
+               }
+               ctx.drawImage(frame, 0, 0, frame.displayWidth, frame.displayHeight);
            }
            frame.close();
          },
@@ -32,11 +49,7 @@ function App() {
            setDecodeStatus(`Error: ${e.message}`);
          }
        });
-       
-       videoDecoder.configure({
-         codec: 'avc1.4d002a', // H.264 Main Profile
-         hardwareAcceleration: 'prefer-hardware',
-       });
+       // Configure is delayed until we get SPS/PPS
     };
     
     const init = async () => {
@@ -81,6 +94,7 @@ function App() {
 
       videoChannel.onmessage = (event) => {
          const chunk = new Uint8Array(event.data);
+         totalBytes += chunk.length;
          const newBuffer = new Uint8Array(naluBuffer.length + chunk.length);
          newBuffer.set(naluBuffer);
          newBuffer.set(chunk, naluBuffer.length);
@@ -101,19 +115,72 @@ function App() {
                
                if (nextStart !== -1) {
                   const nalu = naluBuffer.slice(startIdx, nextStart);
-                  const headerIdx = (nalu[2] === 1) ? 3 : 4;
-                  const nalUnitType = nalu[headerIdx] & 0x1F;
-                  const isKey = nalUnitType === 5 || nalUnitType === 7 || nalUnitType === 8;
                   
-                  try {
-                     if (videoDecoder && videoDecoder.state === "configured") {
-                        videoDecoder.decode(new EncodedVideoChunk({
-                           type: isKey ? 'key' : 'delta',
-                           timestamp: performance.now() * 1000,
-                           data: nalu
-                        }));
+                  // Extract the actual NAL unit payload (remove start code)
+                  const headerIdx = (nalu[2] === 1) ? 3 : 4;
+                  const payload = nalu.slice(headerIdx);
+                  const nalType = payload[0] & 0x1F;
+                  
+                  if (nalType === 7) spsNalu = payload;
+                  if (nalType === 8) ppsNalu = payload;
+                  
+                  if ((nalType === 5 || nalType === 1) && videoDecoder) {
+                     if (nalType === 5) seenKeyFrame = true;
+                     
+                     if (seenKeyFrame && !isDecoderConfigured && spsNalu && ppsNalu) {
+                        const extradata = new Uint8Array(11 + spsNalu.length + ppsNalu.length);
+                        extradata[0] = 1;
+                        extradata[1] = spsNalu[1];
+                        extradata[2] = spsNalu[2];
+                        extradata[3] = spsNalu[3];
+                        extradata[4] = 0xFF;
+                        extradata[5] = 0xE1;
+                        extradata[6] = (spsNalu.length >> 8) & 0xFF;
+                        extradata[7] = spsNalu.length & 0xFF;
+                        extradata.set(spsNalu, 8);
+                        let offset = 8 + spsNalu.length;
+                        extradata[offset] = 1;
+                        extradata[offset+1] = (ppsNalu.length >> 8) & 0xFF;
+                        extradata[offset+2] = ppsNalu.length & 0xFF;
+                        extradata.set(ppsNalu, offset + 3);
+                        
+                        const profileStr = spsNalu[1].toString(16).padStart(2,'0') + spsNalu[2].toString(16).padStart(2,'0') + spsNalu[3].toString(16).padStart(2,'0');
+                        
+                        try {
+                           videoDecoder.configure({
+                              codec: 'avc1.' + profileStr,
+                              description: extradata,
+                              hardwareAcceleration: 'prefer-hardware'
+                           });
+                           isDecoderConfigured = true;
+                           setDecodeStatus('Decoder Configured AVCC');
+                        } catch (e: any) {
+                           console.error(e);
+                           setDecodeStatus('Config Error: ' + e.message);
+                        }
                      }
-                  } catch(e) { console.error(e) }
+                     
+                     if (isDecoderConfigured && seenKeyFrame) {
+                        // Create AVCC chunk: 4-byte length + payload
+                        const avccChunk = new Uint8Array(4 + payload.length);
+                        avccChunk[0] = (payload.length >> 24) & 0xFF;
+                        avccChunk[1] = (payload.length >> 16) & 0xFF;
+                        avccChunk[2] = (payload.length >> 8) & 0xFF;
+                        avccChunk[3] = payload.length & 0xFF;
+                        avccChunk.set(payload, 4);
+                        
+                        try {
+                           videoDecoder.decode(new EncodedVideoChunk({
+                              type: nalType === 5 ? 'key' : 'delta',
+                              timestamp: performance.now() * 1000,
+                              data: avccChunk
+                           }));
+                        } catch(e: any) {
+                           console.error(e);
+                           setDecodeStatus(`Decode Error: ${e.message}`);
+                        }
+                     }
+                  }
                   
                   naluBuffer = naluBuffer.slice(nextStart);
                   i = 0;
@@ -183,6 +250,7 @@ function App() {
     });
     
     return () => {
+      clearInterval(statsInterval);
       ws?.close();
       pc?.close();
       if (videoDecoder?.state !== 'closed') videoDecoder?.close();
@@ -196,7 +264,7 @@ function App() {
         {status}
       </div>
       <div className="absolute top-16 left-4 z-50 px-3 py-1 rounded-full bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-sm font-medium text-white">
-        {decodeStatus} | Frames: {frames}
+        {decodeStatus} | Frames: {frames} | Bytes: {bytesReceived}
       </div>
       
       <canvas ref={videoRef} className="w-full h-full object-contain bg-black" width={1920} height={1080} />

@@ -47,7 +47,14 @@ class LapLinkAgent:
             
             self.pc = RTCPeerConnection(
                 configuration=RTCConfiguration(
-                    iceServers=[RTCIceServer(urls=["stun:stun.l.google.com:19302"])]
+                    iceServers=[
+                        RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+                        RTCIceServer(
+                            urls=["turn:openrelay.metered.ca:80"],
+                            username="openrelayproject",
+                            credential="openrelayproject"
+                        )
+                    ]
                 )
             )
             self.setup_webrtc()
@@ -99,7 +106,7 @@ class LapLinkAgent:
             "d3d11screencapturesrc", "!", 
             "video/x-raw(memory:D3D11Memory),framerate=60/1", "!",
             "d3d11colorconvert", "!",
-            "nvd3d11h264enc", "preset=low-latency-hq", "zerolatency=true", "rc-mode=cbr", "bitrate=5000", "!",
+            "nvd3d11h264enc", "preset=low-latency-hq", "zerolatency=true", "rc-mode=cbr", "bitrate=5000", "gop-size=60", "repeat-sequence-header=true", "!",
             "h264parse", "!",
             "video/x-h264,stream-format=byte-stream,alignment=nal", "!",
             "fdsink", "fd=1"
@@ -107,6 +114,7 @@ class LapLinkAgent:
         
         # Fallback to videotestsrc if d3d11screencapturesrc fails (e.g. no display attached during dev)
         # We will wrap it in a thread
+        loop = asyncio.get_event_loop()
         import threading
         def _run_gst():
             self.gst_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -114,14 +122,14 @@ class LapLinkAgent:
                 # Read chunks and send to datachannel
                 # WebCodecs needs distinct NALUs or Annex B chunks.
                 # A robust approach parses the Annex B stream, but sending 16KB chunks works if WebCodecs buffer is handled.
-                chunk = self.gst_process.stdout.read(16384)
+                chunk = self.gst_process.stdout.read(65536)
                 if not chunk:
                     break
                 if self.video_channel and self.video_channel.readyState == "open":
                     # Note: aiortc channel.send() must be threadsafe if called from another thread
                     asyncio.run_coroutine_threadsafe(
                         self._send_video_chunk(chunk),
-                        asyncio.get_event_loop()
+                        loop
                     )
         threading.Thread(target=_run_gst, daemon=True).start()
 
