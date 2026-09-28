@@ -1,0 +1,19 @@
+{
+  "name": "laplink-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-09-23",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SIGNALING_ROOM",
+        "class_name": "SignalingRoom"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SignalingRoom"]
+    }
+  ]
+}

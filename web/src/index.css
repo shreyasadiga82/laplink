@@ -1,0 +1,12 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", system-ui, sans-serif;
+}
+
+@layer base {
+  body {
+    @apply bg-zinc-950 text-zinc-50 overflow-hidden select-none;
+    touch-action: none; /* Crucial for custom touch gestures */
+  }
+}
