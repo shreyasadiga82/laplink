@@ -16,18 +16,17 @@ def create_image():
 
 class LapLinkHost:
     def __init__(self):
-        self.pin = str(random.randint(1000, 9999))
+        self.pin = "shreyas"
         self.agent_thread = None
         self.agent_loop = None
         
         self.menu = pystray.Menu(
             pystray.MenuItem('LapLink Host', None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem(lambda text: f'PIN: {self.pin}', None, enabled=False),
             pystray.MenuItem(lambda text: f'Status: {"Running" if self.agent_thread else "Stopped"}', None, enabled=False),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem('Start Streaming', self.start_streaming),
             pystray.MenuItem('Stop Streaming', self.stop_streaming),
+            pystray.MenuItem('Start Streaming', self.start_streaming),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem('Quit', self.quit_app)
         )
@@ -61,4 +60,6 @@ class LapLinkHost:
 
 if __name__ == '__main__':
     host = LapLinkHost()
+    # Start automatically
+    host.start_streaming(None, None)
     host.icon.run()

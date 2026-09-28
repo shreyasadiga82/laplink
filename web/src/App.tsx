@@ -6,10 +6,13 @@ function App() {
   const [decodeStatus, setDecodeStatus] = useState<string>('Waiting for stream...');
   const [frames, setFrames] = useState<number>(0);
   const [bytesReceived, setBytesReceived] = useState<number>(0);
-  const [pin, setPin] = useState<string>('');
-  const [isConnecting, setIsConnecting] = useState<boolean>(false);
+  const [pin] = useState<string>('shreyas');
+  const [isConnecting, setIsConnecting] = useState<boolean>(true);
+  const [showStats, setShowStats] = useState<boolean>(true);
   const videoRef = useRef<HTMLCanvasElement>(null);
+  const hiddenInputRef = useRef<HTMLInputElement>(null);
   const controlChannelRef = useRef<RTCDataChannel | null>(null);
+  const lastMouseMoveTime = useRef<number>(0);
   
   useEffect(() => {
     if (!isConnecting || !pin) return;
@@ -206,6 +209,7 @@ function App() {
       };
 
       const controlChannel = pc.createDataChannel("control");
+      controlChannel.onopen = () => console.log("Control channel opened!");
       controlChannelRef.current = controlChannel;
       controlChannel.onmessage = (e) => console.log("Control message:", e.data);
       
@@ -254,7 +258,26 @@ function App() {
          console.error("WS Error:", e);
          setStatus("WS Error");
       };
-      ws.onclose = () => setStatus("WS Closed");
+      ws.onclose = () => {
+         console.log("Signaling WS Closed.");
+         if (pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed') {
+             setStatus("Signaling failed. Retrying...");
+             setTimeout(() => {
+               setIsConnecting(false);
+               setTimeout(() => setIsConnecting(true), 500);
+             }, 2000);
+         }
+      };
+      
+      pc.oniceconnectionstatechange = () => {
+         if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+             setStatus("Stream Lost. Reconnecting...");
+             setTimeout(() => {
+               setIsConnecting(false);
+               setTimeout(() => setIsConnecting(true), 500);
+             }, 2000);
+         }
+      };
     };
     
     init().catch(err => {
@@ -273,25 +296,14 @@ function App() {
   if (!isConnecting) {
     return (
       <div className="flex flex-col h-screen w-screen bg-zinc-950 items-center justify-center text-white">
-        <h1 className="text-4xl font-bold mb-8">LapLink</h1>
-        <div className="flex flex-col gap-4 bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl">
-          <label className="text-sm font-medium text-zinc-400">Enter Host PIN</label>
-          <input 
-            type="text" 
-            value={pin}
-            onChange={(e) => setPin(e.target.value)}
-            className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-2xl text-center font-mono tracking-widest focus:outline-none focus:border-blue-500 transition-colors"
-            placeholder="0000"
-            maxLength={4}
-          />
+        <h1 className="text-4xl font-bold mb-8">LapLink <span className="text-blue-500">v5</span></h1>
+        <div className="flex flex-col gap-4 bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl items-center">
+          <p className="text-zinc-400 mb-4">Stream Disconnected</p>
           <button 
-            onClick={() => {
-              if (pin.length === 4) setIsConnecting(true);
-            }}
-            disabled={pin.length !== 4}
-            className="mt-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:hover:bg-blue-600 px-6 py-3 rounded-xl font-medium transition-colors"
+            onClick={() => setIsConnecting(true)}
+            className="bg-blue-600 hover:bg-blue-500 px-8 py-3 rounded-xl font-medium transition-colors"
           >
-            Connect
+            Reconnect to Laptop
           </button>
         </div>
       </div>
@@ -306,10 +318,6 @@ function App() {
 
   const getScaledCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const rect = videoRef.current!.getBoundingClientRect();
-    // Calculate scaling to preserve aspect ratio (object-contain)
-    const scaleX = videoRef.current!.width / rect.width;
-    const scaleY = videoRef.current!.height / rect.height;
-    const scale = Math.max(scaleX, scaleY);
     
     // We'll just send relative coordinates between 0.0 and 1.0
     return {
@@ -324,9 +332,48 @@ function App() {
         <div className={`w-2 h-2 rounded-full ${status.includes('Connected') ? 'bg-green-500' : 'bg-red-500'}`} />
         {status}
       </div>
-      <div className="absolute top-16 left-4 z-50 px-3 py-1 rounded-full bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-sm font-medium text-white pointer-events-none">
-        {decodeStatus} | Frames: {frames} | Bytes: {bytesReceived}
-      </div>
+      {showStats && (
+        <div className="absolute top-16 left-4 z-50 px-4 py-3 rounded-2xl bg-zinc-900/90 backdrop-blur-md border border-zinc-800 flex flex-col gap-3 text-sm font-medium text-white shadow-xl">
+          <div className="flex flex-col gap-1">
+            <span className="text-zinc-400 text-xs uppercase tracking-wider font-bold">Stream Stats</span>
+            <span>{decodeStatus} | {frames}fps | {(bytesReceived/1024/1024).toFixed(1)}MB</span>
+          </div>
+          <div className="h-[1px] w-full bg-zinc-800" />
+          <div className="flex flex-col gap-2">
+            <span className="text-zinc-400 text-xs uppercase tracking-wider font-bold">Quality</span>
+            <div className="flex gap-2">
+              {['1080p', '720p', '480p'].map(q => (
+                <button
+                  key={q}
+                  onClick={() => sendControl({ type: 'quality', quality: q })}
+                  className="px-3 py-1.5 rounded-lg bg-zinc-800 hover:bg-blue-600 transition-colors text-xs font-semibold"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {/* Hidden input to trigger mobile keyboard */}
+      <input 
+        ref={hiddenInputRef}
+        type="text" 
+        className="absolute top-0 left-0 w-0 h-0 opacity-0"
+        onKeyDown={(e) => {
+          sendControl({ type: 'keydown', key: e.key });
+          if (e.key === 'Backspace') {
+             // Mobile backspace fix might be needed, but this works for basic
+             e.preventDefault();
+          }
+        }}
+        onKeyUp={(e) => {
+          sendControl({ type: 'keyup', key: e.key });
+          // Clear input so it doesn't build up a massive string
+          e.currentTarget.value = '';
+        }}
+      />
       
       <canvas 
         ref={videoRef} 
@@ -341,21 +388,55 @@ function App() {
           sendControl({ type: 'mouseup', button: e.button });
         }}
         onPointerMove={(e) => {
-          const { x, y } = getScaledCoords(e);
-          sendControl({ type: 'mousemove', x, y });
+          const now = Date.now();
+          if (now - lastMouseMoveTime.current > 16) { // ~60fps throttle
+            const { x, y } = getScaledCoords(e);
+            sendControl({ type: 'mousemove', x, y });
+            lastMouseMoveTime.current = now;
+          }
         }}
         onContextMenu={(e) => e.preventDefault()}
       />
 
       <div className="absolute bottom-4 z-50 flex gap-2 px-4 py-2 rounded-2xl bg-zinc-900/80 backdrop-blur-md border border-zinc-800">
-         <button className="p-3 hover:bg-zinc-800 rounded-xl transition-colors text-white text-xl">
+         <button 
+            className="p-3 hover:bg-zinc-800 rounded-xl transition-colors text-white text-xl"
+            onClick={() => hiddenInputRef.current?.focus()}
+            title="Open Keyboard"
+         >
             ⌨️
          </button>
-         <button className="p-3 hover:bg-zinc-800 rounded-xl transition-colors text-white text-xl">
+         <button 
+            className="p-3 hover:bg-zinc-800 rounded-xl transition-colors text-white text-xl"
+            onClick={() => sendControl({ type: 'mousedown', button: 0 })}
+            title="Left Click"
+         >
             🖱️
          </button>
-         <button className="p-3 hover:bg-zinc-800 rounded-xl transition-colors text-white text-xl">
+         <button 
+            className="p-3 hover:bg-zinc-800 rounded-xl transition-colors text-white text-xl"
+            onClick={() => sendControl({ type: 'refresh' })}
+            title="Refresh Stream"
+         >
+            🔄
+         </button>
+         <button 
+            className="p-3 hover:bg-zinc-800 rounded-xl transition-colors text-white text-xl"
+            onClick={() => setShowStats(!showStats)}
+            title="Toggle Stats"
+         >
             ⚙️
+         </button>
+         <button 
+            className="p-3 hover:bg-red-500/30 rounded-xl transition-colors text-white text-xl"
+            onClick={() => {
+              setIsConnecting(false);
+              setStatus('');
+              setDecodeStatus('');
+            }}
+            title="Disconnect / Reconnect"
+         >
+            🔌
          </button>
       </div>
     </div>

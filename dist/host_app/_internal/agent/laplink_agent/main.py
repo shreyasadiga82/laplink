@@ -3,6 +3,12 @@ import json
 import logging
 import subprocess
 import os
+import pyautogui
+pyautogui.FAILSAFE = False
+pyautogui.MINIMUM_DURATION = 0
+pyautogui.MINIMUM_SLEEP = 0
+pyautogui.PAUSE = 0
+
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCConfiguration, RTCIceServer, RTCDataChannel
 import websockets
 
@@ -18,22 +24,26 @@ class LapLinkAgent:
         self.video_channel: RTCDataChannel = None
         self.control_channel: RTCDataChannel = None
         self.gst_process = None
+        self.current_quality = "720p"
 
     async def connect_signaling(self):
-        try:
-            async with websockets.connect(RELAY_URL) as ws:
-                self.signaling_ws = ws
-                logger.info("Connected to Relay signaling server")
-                
-                device_id = os.environ.get("LAPLINK_PIN", "laptop")
-                await ws.send(json.dumps({"type": "register", "device": device_id}))
+        while True:
+            try:
+                # Add ping_interval=20 to keep Cloudflare Worker connection alive
+                async with websockets.connect(RELAY_URL, ping_interval=20, ping_timeout=20) as ws:
+                    self.signaling_ws = ws
+                    logger.info("Connected to Relay signaling server")
+                    
+                    device_id = os.environ.get("LAPLINK_PIN", "laptop")
+                    await ws.send(json.dumps({"type": "register", "device": device_id}))
 
-                async for message in ws:
-                    await self.handle_signaling_message(json.loads(message))
-        except Exception as e:
-            logger.error(f"Signaling error: {e}")
+                    async for message in ws:
+                        await self.handle_signaling_message(json.loads(message))
+            except Exception as e:
+                logger.error(f"Signaling error: {e}")
+            
+            logger.info("Signaling WS Closed. Reconnecting in 5 seconds...")
             await asyncio.sleep(5)
-            # Reconnect logic would go here
 
     async def handle_signaling_message(self, msg):
         target = msg.get("from")
@@ -96,7 +106,6 @@ class LapLinkAgent:
                 self.start_gstreamer()
             elif channel.label == "control":
                 self.control_channel = channel
-                import pyautogui
                 
                 @channel.on("message")
                 def on_message(message):
@@ -105,31 +114,59 @@ class LapLinkAgent:
                         ctype = cmd.get("type")
                         if ctype == "mousemove":
                             x, y = cmd.get("x"), cmd.get("y")
-                            # Convert relative coords to absolute pixel coords
                             screen_width, screen_height = pyautogui.size()
-                            # PyAutoGUI takes integer coords
                             abs_x = int(x * screen_width)
                             abs_y = int(y * screen_height)
-                            # Use _pause=False to reduce latency
                             pyautogui.moveTo(abs_x, abs_y, _pause=False)
                         elif ctype == "mousedown":
                             pyautogui.mouseDown(_pause=False)
                         elif ctype == "mouseup":
                             pyautogui.mouseUp(_pause=False)
+                        elif ctype == "keydown":
+                            key = cmd.get("key")
+                            if key:
+                                pyautogui.keyDown(key, _pause=False)
+                        elif ctype == "keyup":
+                            key = cmd.get("key")
+                            if key:
+                                pyautogui.keyUp(key, _pause=False)
+                        elif ctype == "refresh":
+                            logger.info("Received refresh command. Restarting GStreamer...")
+                            if self.gst_process:
+                                self.gst_process.kill()
+                                self.gst_process = None
+                            self.start_gstreamer()
+                        elif ctype == "quality":
+                            new_quality = cmd.get("quality", "720p")
+                            logger.info(f"Received quality command: {new_quality}")
+                            self.current_quality = new_quality
+                            if self.gst_process:
+                                self.gst_process.kill()
+                                self.gst_process = None
+                            self.start_gstreamer()
                     except Exception as e:
                         logger.error(f"Failed to process control msg: {e}")
 
     def start_gstreamer(self):
         if self.gst_process:
             return
-        logger.info("Starting GStreamer pipeline")
-        # For Phase 1 testing, we'll just capture a test video pattern and encode it
+        logger.info(f"Starting GStreamer pipeline at {self.current_quality}")
+        
+        if self.current_quality == "1080p":
+            fps, w, h, bit = "60/1", "1920", "1080", "4000"
+        elif self.current_quality == "480p":
+            fps, w, h, bit = "30/1", "854", "480", "500"
+        else: # 720p default
+            fps, w, h, bit = "30/1", "1280", "720", "1500"
+            
         cmd = [
             "gst-launch-1.0.exe", "-q",
             "d3d11screencapturesrc", "!", 
-            "video/x-raw(memory:D3D11Memory),framerate=60/1", "!",
+            f"video/x-raw(memory:D3D11Memory),framerate={fps}", "!",
+            "d3d11scale", "!",
+            f"video/x-raw(memory:D3D11Memory),width={w},height={h}", "!",
             "d3d11colorconvert", "!",
-            "nvd3d11h264enc", "preset=low-latency-hq", "zerolatency=true", "rc-mode=cbr", "bitrate=5000", "gop-size=60", "repeat-sequence-header=true", "!",
+            "nvd3d11h264enc", "preset=low-latency-hq", "zerolatency=true", "rc-mode=cbr", f"bitrate={bit}", "gop-size=15", "repeat-sequence-header=true", "!",
             "h264parse", "!",
             "video/x-h264,stream-format=byte-stream,alignment=nal", "!",
             "fdsink", "fd=1"
@@ -142,22 +179,19 @@ class LapLinkAgent:
         def _run_gst():
             self.gst_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             while True:
-                # Read chunks and send to datachannel
-                # WebCodecs needs distinct NALUs or Annex B chunks.
-                # A robust approach parses the Annex B stream, but sending 16KB chunks works if WebCodecs buffer is handled.
+                if self.video_channel and hasattr(self.video_channel, 'bufferedAmount'):
+                    import time
+                    # Flow control: if buffer exceeds 1MB, wait. This prevents massive video lag!
+                    while self.video_channel.readyState == "open" and self.video_channel.bufferedAmount > 1024 * 1024:
+                        time.sleep(0.01)
+
                 chunk = self.gst_process.stdout.read(65536)
                 if not chunk:
                     break
                 if self.video_channel and self.video_channel.readyState == "open":
-                    # Note: aiortc channel.send() must be threadsafe if called from another thread
-                    asyncio.run_coroutine_threadsafe(
-                        self._send_video_chunk(chunk),
-                        loop
-                    )
-        threading.Thread(target=_run_gst, daemon=True).start()
+                    loop.call_soon_threadsafe(self.video_channel.send, chunk)
 
-    async def _send_video_chunk(self, chunk):
-        self.video_channel.send(chunk)
+        threading.Thread(target=_run_gst, daemon=True).start()
 
 async def main():
     agent = LapLinkAgent()
