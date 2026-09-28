@@ -6,9 +6,14 @@ function App() {
   const [decodeStatus, setDecodeStatus] = useState<string>('Waiting for stream...');
   const [frames, setFrames] = useState<number>(0);
   const [bytesReceived, setBytesReceived] = useState<number>(0);
+  const [pin, setPin] = useState<string>('');
+  const [isConnecting, setIsConnecting] = useState<boolean>(false);
   const videoRef = useRef<HTMLCanvasElement>(null);
+  const controlChannelRef = useRef<RTCDataChannel | null>(null);
   
   useEffect(() => {
+    if (!isConnecting || !pin) return;
+    
     let ws: WebSocket;
     let pc: RTCPeerConnection;
     let videoDecoder: VideoDecoder | null = null;
@@ -57,13 +62,20 @@ function App() {
       ws = new WebSocket("wss://laplink-worker.shreyasadiga82.workers.dev");
       
       pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { 
+             urls: "turn:openrelay.metered.ca:80",
+             username: "openrelayproject",
+             credential: "openrelayproject"
+          }
+        ]
       });
 
       pc.onicecandidate = (event) => {
         if (event.candidate && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({
-            target: "laptop",
+            target: pin,
             from: "client1",
             payload: { 
                type: "candidate", 
@@ -150,7 +162,7 @@ function App() {
                            videoDecoder.configure({
                               codec: 'avc1.' + profileStr,
                               description: extradata,
-                              hardwareAcceleration: 'prefer-hardware'
+                              hardwareAcceleration: 'no-preference'
                            });
                            isDecoderConfigured = true;
                            setDecodeStatus('Decoder Configured AVCC');
@@ -194,6 +206,7 @@ function App() {
       };
 
       const controlChannel = pc.createDataChannel("control");
+      controlChannelRef.current = controlChannel;
       controlChannel.onmessage = (e) => console.log("Control message:", e.data);
       
       ws.onopen = async () => {
@@ -201,7 +214,7 @@ function App() {
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         ws.send(JSON.stringify({
-          target: "laptop",
+          target: pin,
           from: "client1",
           payload: { type: offer.type, sdp: offer.sdp }
         }));
@@ -211,12 +224,12 @@ function App() {
         try {
           const msg = JSON.parse(e.data);
           
-          if (msg.type === "register" && msg.device === "laptop") {
+          if (msg.type === "register" && msg.device === pin) {
              console.log("Agent came online! Sending offer...");
              const offer = await pc.createOffer();
              await pc.setLocalDescription(offer);
              ws.send(JSON.stringify({
-               target: "laptop",
+               target: pin,
                from: "client1",
                payload: { type: offer.type, sdp: offer.sdp }
              }));
@@ -255,19 +268,84 @@ function App() {
       pc?.close();
       if (videoDecoder?.state !== 'closed') videoDecoder?.close();
     };
-  }, []);
+  }, [isConnecting]);
+
+  if (!isConnecting) {
+    return (
+      <div className="flex flex-col h-screen w-screen bg-zinc-950 items-center justify-center text-white">
+        <h1 className="text-4xl font-bold mb-8">LapLink</h1>
+        <div className="flex flex-col gap-4 bg-zinc-900 p-8 rounded-2xl border border-zinc-800 shadow-2xl">
+          <label className="text-sm font-medium text-zinc-400">Enter Host PIN</label>
+          <input 
+            type="text" 
+            value={pin}
+            onChange={(e) => setPin(e.target.value)}
+            className="bg-zinc-950 border border-zinc-800 rounded-xl px-4 py-3 text-2xl text-center font-mono tracking-widest focus:outline-none focus:border-blue-500 transition-colors"
+            placeholder="0000"
+            maxLength={4}
+          />
+          <button 
+            onClick={() => {
+              if (pin.length === 4) setIsConnecting(true);
+            }}
+            disabled={pin.length !== 4}
+            className="mt-4 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:hover:bg-blue-600 px-6 py-3 rounded-xl font-medium transition-colors"
+          >
+            Connect
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  const sendControl = (msg: any) => {
+    if (controlChannelRef.current?.readyState === 'open') {
+      controlChannelRef.current.send(JSON.stringify(msg));
+    }
+  };
+
+  const getScaledCoords = (e: React.PointerEvent<HTMLCanvasElement>) => {
+    const rect = videoRef.current!.getBoundingClientRect();
+    // Calculate scaling to preserve aspect ratio (object-contain)
+    const scaleX = videoRef.current!.width / rect.width;
+    const scaleY = videoRef.current!.height / rect.height;
+    const scale = Math.max(scaleX, scaleY);
+    
+    // We'll just send relative coordinates between 0.0 and 1.0
+    return {
+      x: (e.clientX - rect.left) / rect.width,
+      y: (e.clientY - rect.top) / rect.height
+    };
+  };
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-zinc-950 items-center justify-center relative">
-      <div className="absolute top-4 left-4 z-50 px-3 py-1 rounded-full bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-sm font-medium flex items-center gap-2 text-white">
+    <div className="flex flex-col h-screen w-screen bg-zinc-950 items-center justify-center relative touch-none">
+      <div className="absolute top-4 left-4 z-50 px-3 py-1 rounded-full bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-sm font-medium flex items-center gap-2 text-white pointer-events-none">
         <div className={`w-2 h-2 rounded-full ${status.includes('Connected') ? 'bg-green-500' : 'bg-red-500'}`} />
         {status}
       </div>
-      <div className="absolute top-16 left-4 z-50 px-3 py-1 rounded-full bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-sm font-medium text-white">
+      <div className="absolute top-16 left-4 z-50 px-3 py-1 rounded-full bg-zinc-900/80 backdrop-blur-md border border-zinc-800 text-sm font-medium text-white pointer-events-none">
         {decodeStatus} | Frames: {frames} | Bytes: {bytesReceived}
       </div>
       
-      <canvas ref={videoRef} className="w-full h-full object-contain bg-black" width={1920} height={1080} />
+      <canvas 
+        ref={videoRef} 
+        className="w-full h-full object-contain bg-black touch-none select-none" 
+        width={1920} height={1080} 
+        onPointerDown={(e) => {
+          e.currentTarget.setPointerCapture(e.pointerId);
+          sendControl({ type: 'mousedown', button: e.button });
+        }}
+        onPointerUp={(e) => {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+          sendControl({ type: 'mouseup', button: e.button });
+        }}
+        onPointerMove={(e) => {
+          const { x, y } = getScaledCoords(e);
+          sendControl({ type: 'mousemove', x, y });
+        }}
+        onContextMenu={(e) => e.preventDefault()}
+      />
 
       <div className="absolute bottom-4 z-50 flex gap-2 px-4 py-2 rounded-2xl bg-zinc-900/80 backdrop-blur-md border border-zinc-800">
          <button className="p-3 hover:bg-zinc-800 rounded-xl transition-colors text-white text-xl">
